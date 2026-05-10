@@ -314,6 +314,7 @@ namespace fio
     }
     else
     {
+      if (!g_sdFs) return 6;     // SDCARD requested but no fs injected
       fh = g_sdFs->open(path, openMode);
     }
     if (!fh) return 6;
