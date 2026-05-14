@@ -86,6 +86,23 @@ namespace fio
   inline bool   g_sdOk = false;
   inline fs::FS* g_sdFs = nullptr;
 
+  // Optional callback invoked when an in-flight SD operation fails —
+  // typically because the card was yanked. The project installs this
+  // to drop its cached SD-mount state so the next access re-probes
+  // (lazy mount on access). file_io itself stays hardware-agnostic;
+  // it just announces the failure and lets the project decide what to
+  // do (e.g., call SD.end(), clear g_sdFs, etc.).
+  typedef void (*SDInvalidateFn)();
+  inline SDInvalidateFn g_sdInvalidate = nullptr;
+  inline void setSDInvalidateCallback(SDInvalidateFn cb) { g_sdInvalidate = cb; }
+
+  // Signal an SD failure. Called from internal failure paths; no-ops
+  // when no callback is installed.
+  inline void notifySDFailure()
+  {
+    if (g_sdInvalidate) g_sdInvalidate();
+  }
+
   // Inject the SD filesystem after the project finishes its hardware-
   // specific bring-up. Pass nullptr to mark SD as unavailable.
   inline void setSDFs(fs::FS* fs)
@@ -311,13 +328,27 @@ namespace fio
     if (dev == DEV_FLASH)
     {
       fh = LittleFS.open(path, openMode);
+      if (!fh) return 6;
     }
     else
     {
-      if (!g_sdFs) return 6;     // SDCARD requested but no fs injected
+      // No SD fs registered = device truly absent (e.g. card not in
+      // slot at boot). Distinct from "card mounted but file missing"
+      // so the caller can map to TI I/O ERROR 05 (device) vs 06 (file).
+      if (!g_sdFs) return 4;
       fh = g_sdFs->open(path, openMode);
+      if (!fh)
+      {
+        // SD was mounted at this layer but the FS rejected the open.
+        // Most common cause on this hardware is "card was yanked
+        // since the last successful op" — invalidate the cached mount
+        // so the next access re-probes. The current call still
+        // returns 6 (file error) since we genuinely can't tell
+        // file-not-found from gone-card without a separate probe.
+        notifySDFailure();
+        return 6;
+      }
     }
-    if (!fh) return 6;
 
     s.inUse = true;
     s.device = dev;
@@ -459,15 +490,26 @@ namespace fio
       // current position and bump curRecord.
       int n = (int)strlen(text);
       if (n > s.recLen) n = s.recLen;
-      s.fh.write((const uint8_t*)text, n);
+      size_t got = s.fh.write((const uint8_t*)text, n);
+      if ((int)got != n)
+      {
+        if (s.device == DEV_SD) notifySDFailure();
+        return 6;
+      }
       for (int i = n; i < s.recLen; i++) s.fh.write((uint8_t)' ');
       s.fh.flush();
       s.curRecord++;
       return 0;
     }
 
-    s.fh.print(text);
-    s.fh.print('\n');
+    int len = (int)strlen(text);
+    size_t got = s.fh.write((const uint8_t*)text, len);
+    if ((int)got != len)
+    {
+      if (s.device == DEV_SD) notifySDFailure();
+      return 6;
+    }
+    s.fh.write((uint8_t)'\n');
     s.fh.flush();
     return 0;
   }
@@ -550,6 +592,49 @@ namespace fio
   inline void closeAll()
   {
     for (int i = 1; i <= MAX_FILES; i++) closeFile(i);
+  }
+
+  // TI Extended BASIC I/O error codes — the two-digit number that appears
+  // after "I/O ERROR" in run-mode and that CALL ERR returns. Reference:
+  // TI Extended BASIC manual, Appendix A.
+  enum TIIoError : int
+  {
+    TI_IO_WRITE_PROTECT = 0,
+    TI_IO_BAD_ATTR      = 1,
+    TI_IO_ILLEGAL_OP    = 2,
+    TI_IO_OUT_OF_SPACE  = 3,
+    TI_IO_PAST_EOF      = 4,
+    TI_IO_DEVICE_ERROR  = 5,   // device missing / hardware failure
+    TI_IO_FILE_ERROR    = 6,   // file not found / bad type / FS corruption
+    TI_IO_ALREADY_OPEN  = 7,
+  };
+
+  // Translate an internal file_io return code (1..6, see openFile/printLineTo
+  // /readLineFrom doc comments) to the TI two-digit I/O error code. `unit`
+  // is the file slot the error came from — needed to tell device-error from
+  // file-error (an FS error on a DSK or SD slot is a device problem, on
+  // FLASH it's a file problem). Pass unit=0 for unit-agnostic errors.
+  inline int toTIError(int fioCode, int unit = 0)
+  {
+    switch (fioCode)
+    {
+      case 0: return -1;   // success — caller should not raise an error
+      case 1: return TI_IO_ILLEGAL_OP;     // bad unit number
+      case 2: return TI_IO_ALREADY_OPEN;
+      case 3: return TI_IO_BAD_ATTR;       // bad spec parse
+      case 4: return TI_IO_DEVICE_ERROR;   // device unavailable
+      case 5: return TI_IO_BAD_ATTR;       // unsupported mode/format
+      case 6:
+        // FS-layer failure: device error if the slot is on removable
+        // media, file error if on internal flash.
+        if (unitValid(unit) && g_slots[unit].inUse)
+        {
+          Device d = g_slots[unit].device;
+          if (d == DEV_SD || d == DEV_DSK) return TI_IO_DEVICE_ERROR;
+        }
+        return TI_IO_FILE_ERROR;
+      default: return TI_IO_FILE_ERROR;
+    }
   }
 }
 
