@@ -57,9 +57,33 @@ namespace progio
     char  tiName[16];
   };
 
+  // Is `name` a reserved device-prefix token? FLASH, SDCARD, and the
+  // 35 DSK<n> drive specs (DSK1..DSK9, DSKA..DSKZ) can never be the
+  // file portion of a filespec — bare or prefixed — because the user
+  // almost certainly meant the device, not a file literally named
+  // after it. Case-insensitive.
+  inline bool isReservedName(const char* name)
+  {
+    if (!name) return false;
+    if (strcasecmp(name, "FLASH")  == 0) return true;
+    if (strcasecmp(name, "SDCARD") == 0) return true;
+    // DSK + single digit (1..9) or single letter (A..Z) is reserved
+    // whether or not it's the start of a device spec.
+    if ((name[0] == 'D' || name[0] == 'd') &&
+        (name[1] == 'S' || name[1] == 's') &&
+        (name[2] == 'K' || name[2] == 'k') &&
+        name[3] != '\0' && name[4] == '\0')
+    {
+      return fio::driveFromChar(name[3]) > 0;
+    }
+    return false;
+  }
+
   // Parse "FLASH.NAME" / "SDCARD.NAME" / "DSKn.NAME" / bare "NAME".
   // Bare names default to FLASH (back-compat with pre-routing programs).
-  // Empty input returns false.
+  // Empty input, missing file portion after a prefix, or file portion
+  // equal to a reserved token all return false (caller treats as
+  // * BAD FILE NAME).
   inline bool parseTarget(const char* spec, Target& out)
   {
     if (!spec || spec[0] == '\0') return false;
@@ -70,9 +94,11 @@ namespace progio
       int drive = fio::driveFromChar(spec[3]);
       if (drive > 0 && spec[4] == '.')
       {
+        const char* tiName = spec + 5;
+        if (tiName[0] == '\0' || isReservedName(tiName)) return false;
         out.kind  = KIND_DSK;
         out.drive = drive;
-        strncpy(out.tiName, spec + 5, sizeof(out.tiName) - 1);
+        strncpy(out.tiName, tiName, sizeof(out.tiName) - 1);
         out.tiName[sizeof(out.tiName) - 1] = '\0';
         return true;
       }
@@ -82,20 +108,27 @@ namespace progio
 
     if (strncasecmp(spec, "FLASH.", 6) == 0)
     {
+      const char* name = spec + 6;
+      if (name[0] == '\0' || isReservedName(name)) return false;
       out.kind = KIND_FLASH;
-      strncpy(out.name, spec + 6, sizeof(out.name) - 1);
+      strncpy(out.name, name, sizeof(out.name) - 1);
       out.name[sizeof(out.name) - 1] = '\0';
       return true;
     }
     if (strncasecmp(spec, "SDCARD.", 7) == 0)
     {
+      const char* name = spec + 7;
+      if (name[0] == '\0' || isReservedName(name)) return false;
       out.kind = KIND_SDCARD;
-      strncpy(out.name, spec + 7, sizeof(out.name) - 1);
+      strncpy(out.name, name, sizeof(out.name) - 1);
       out.name[sizeof(out.name) - 1] = '\0';
       return true;
     }
 
-    // Bare name → FLASH (back-compat).
+    // Bare name → FLASH (back-compat). Reject bare reserved tokens —
+    // SAVE "SDCARD" or SAVE "DSK1" almost certainly mean the user
+    // typed a device name where they meant a filename.
+    if (isReservedName(spec)) return false;
     out.kind = KIND_FLASH;
     strncpy(out.name, spec, sizeof(out.name) - 1);
     out.name[sizeof(out.name) - 1] = '\0';
