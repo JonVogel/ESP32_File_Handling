@@ -267,13 +267,30 @@ namespace dsk
 
     // Low-level sector write. Fails if image is read-only or if the
     // underlying FS write is short.
+    //
+    // Intentionally does NOT flush() — per-sector flushing on LittleFS
+    // commits a flash page each call (~10-100 ms including any block
+    // erase), and a single PROGRAM save fires ~10-13 sector writes, so
+    // flushing every one stalls the interpreter for seconds. Callers
+    // performing a multi-sector logical write (writeRawFile, the
+    // DIS/VAR streaming writer, etc.) call flushImage() once at the
+    // end. LittleFS retains in-flight data in its RAM cache until then
+    // and commits it as a batch — same correctness, no stall.
     bool writeSector(uint16_t sector, const uint8_t* buf)
     {
       if (!m_fh || m_ro) return false;
       if (!m_fh.seek((uint32_t)sector * SECTOR_SIZE)) return false;
       int n = m_fh.write(buf, SECTOR_SIZE);
-      m_fh.flush();
       return n == SECTOR_SIZE;
+    }
+
+    // Commit any buffered sector writes to flash. Call once at the end
+    // of a logical save (PROGRAM save, DIS/VAR close, batch copy, etc.)
+    // so the on-disk state survives a power-cycle without paying the
+    // per-sector flush cost.
+    void flushImage()
+    {
+      if (m_fh && !m_ro) m_fh.flush();
     }
 
     // Create a fresh, blank V9T9 image at the given path. totalSectors:
@@ -989,7 +1006,9 @@ namespace dsk
       }
       dir[insertAt * 2]     = (fdrSec >> 8) & 0xFF;
       dir[insertAt * 2 + 1] = fdrSec & 0xFF;
-      return writeSector(1, dir);
+      if (!writeSector(1, dir)) return false;
+      flushImage();   // commit the whole save as one flash transaction
+      return true;
     }
 
     bool closeDisVarWriter(DisVarWriter& w)
@@ -1029,6 +1048,7 @@ namespace dsk
       }
 
       if (!writeSector(w.fdrSec, fdr)) return false;
+      flushImage();   // commit the whole DIS/VAR write as one transaction
       w.img = nullptr;
       return true;
     }
