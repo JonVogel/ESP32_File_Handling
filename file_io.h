@@ -111,6 +111,27 @@ namespace fio
     g_sdOk = (fs != nullptr);
   }
 
+  // Symmetric partner to setSDInvalidateCallback: the project supplies
+  // a function that knows how to bring SD up from scratch (SD_MMC on
+  // the Box-3, SD-over-SPI on the RGB-panel build, etc.). When SD has
+  // been invalidated (or was never up) and a caller needs it, file_io
+  // invokes this callback to attempt a fresh mount. The callback is
+  // expected to call setSDFs() on success and return true.
+  typedef bool (*SDInitFn)();
+  inline SDInitFn g_sdInit = nullptr;
+  inline void setSDInitCallback(SDInitFn cb) { g_sdInit = cb; }
+
+  // Lazy-mount entry point. Callers that want to use SD should run this
+  // first instead of checking g_sdOk directly: a stale invalidation
+  // (e.g. card was yanked and then reinserted) will silently re-mount
+  // on the next call. Returns true if SD is currently usable.
+  inline bool ensureSdReady()
+  {
+    if (g_sdOk) return true;
+    if (g_sdInit) return g_sdInit();
+    return false;
+  }
+
   // Mount table: DSK1..DSK3. Each slot points to a DskImage backed by
   // either LittleFS or the SD card. Unmounted slots have
   // isOpen() == false.
