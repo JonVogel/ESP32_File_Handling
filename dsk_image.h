@@ -912,10 +912,30 @@ namespace dsk
       return byteCount;
     }
 
-    // Write buf as a new file of the given type flags (e.g. 0x01 for
-    // PROGRAM). Overwrites any existing file of this name.
+    // Write buf as a new file. Default invocation (single typeFlags arg)
+    // matches the original PROGRAM-only behavior — sectorCount derived
+    // from size, recLen=0, numRecords=0. For record-structured uploads
+    // (DIS/FIX, DIS/VAR, INT/FIX, INT/VAR) callers pass the extra
+    // metadata explicitly (typically parsed out of a TIFILES header,
+    // see the caller in TI_Web_Files_ESP /api/dskupload).
+    //
+    // typeFlags uses the V9T9 convention (see file header comment at top):
+    //   0x01 = PROGRAM, 0x02 = INTERNAL, 0x40 = VARIABLE.
+    // When caller wants the FDR fields to come from explicit values
+    // instead of being computed:
+    //   - recLen:        logical record length (1..254); 0 for PROGRAM
+    //   - numRecords:    total records in the file (LE in FDR, TI quirk)
+    //   - recsPerSector: 0 means "compute as SECTOR_SIZE / recLen" for
+    //                    FIXED files; VARIABLE files store this as 0 too
+    //   - eofOffset:     byte offset in last sector; -1 means "compute
+    //                    from size % SECTOR_SIZE" (PROGRAM behavior)
+    // Overwrites any existing file of this name.
     bool writeRawFile(const char* name, const uint8_t* buf, int size,
-                      uint8_t typeFlags)
+                      uint8_t typeFlags,
+                      uint8_t recLen        = 0,
+                      uint16_t numRecords   = 0,
+                      uint8_t recsPerSector = 0,
+                      int eofOffset         = -1)
     {
       if (m_ro) return false;
       if (!deleteFile(name)) return false;
@@ -962,11 +982,23 @@ namespace dsk
       padName(name, padded);
       memcpy(fdr, padded, 10);
       fdr[0x0C] = typeFlags;
+      // records-per-sector: caller-provided when set, else computed for
+      // FIXED files, else 0 (VARIABLE / PROGRAM)
+      uint8_t rps = recsPerSector;
+      if (rps == 0 && recLen > 0 && !(typeFlags & 0x40))
+      {
+        rps = (uint8_t)(SECTOR_SIZE / recLen);
+      }
+      fdr[0x0D] = rps;
       fdr[0x0E] = (sectorsNeeded >> 8) & 0xFF;
       fdr[0x0F] = sectorsNeeded & 0xFF;
-      fdr[0x10] = (uint8_t)(size % SECTOR_SIZE);
-      fdr[0x11] = 0;   // no record length for PROGRAM
-      fdr[0x12] = 0; fdr[0x13] = 0;
+      fdr[0x10] = (eofOffset < 0)
+                  ? (uint8_t)(size % SECTOR_SIZE)
+                  : (uint8_t)eofOffset;
+      fdr[0x11] = recLen;
+      // Record count is little-endian (TI quirk).
+      fdr[0x12] = (uint8_t)(numRecords & 0xFF);
+      fdr[0x13] = (uint8_t)((numRecords >> 8) & 0xFF);
 
       // Build cluster chain (consolidate contiguous runs)
       int off = 0x1C;
